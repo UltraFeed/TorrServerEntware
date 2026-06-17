@@ -1,0 +1,323 @@
+#!/bin/sh
+
+ENABLED=${ENABLED:-yes}
+DESC="TorrServer"
+export DESC
+PATH=/opt/sbin:/opt/bin:/opt/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+if [ -f /opt/etc/init.d/rc.func ]; then
+    . /opt/etc/init.d/rc.func
+fi
+
+TORR_SERVER_DIR=/opt/etc/torrserver
+TORR_SERVER_BIN=$TORR_SERVER_DIR/TorrServer-linux-arm64
+PIDFILE=/var/run/torrserver.pid
+PORT=${PORT:-8090}
+SERVER_URL=${SERVER_URL:-http://127.0.0.1:$PORT}
+LOGTAG="TorrServer"
+
+NETWORK_WAIT_SECS=${NETWORK_WAIT_SECS:-60}
+NETWORK_CHECK_INTERVAL=${NETWORK_CHECK_INTERVAL:-5}
+SHUTDOWN_WAIT_SECS=${SHUTDOWN_WAIT_SECS:-10}
+SHUTDOWN_CHECK_INTERVAL=${SHUTDOWN_CHECK_INTERVAL:-1}
+
+mkdir -p "$TORR_SERVER_DIR"
+chmod 755 "$TORR_SERVER_DIR"
+
+set -eu
+set -o pipefail
+
+log() {
+    local type=$1
+    shift
+    echo "$type: $*" >/dev/console
+    logger -p notice -t "$LOGTAG" "$*"
+}
+
+log_info() { log "INFO" "$*"; }
+log_error() { log "ERROR" "$*"; }
+
+create_torrserver_cmd() {
+    local torr_cmd="/opt/bin/torrserver"
+    local torr_dir="/opt/bin"
+
+    if [ ! -d "$torr_dir" ]; then
+        log_error "Directory '$torr_dir' does not exist. Symlink was not created."
+        return
+    fi
+
+    if [ ! -x "$torr_cmd" ]; then
+        ln -sf /opt/etc/init.d/S55torrserver "$torr_cmd"
+        log_info "Command 'torrserver' created in /opt/bin"
+    fi
+}
+create_torrserver_cmd
+
+cleanup_tmp() {
+    if [ -n "${TMPDOWNLOAD:-}" ] && [ -f "$TMPDOWNLOAD" ]; then
+        rm -f "$TMPDOWNLOAD"
+    fi
+}
+trap 'cleanup_tmp' EXIT
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+require_tools() {
+    if ! command_exists "curl"; then
+        log_error "Required tool not found: curl. Exiting."
+        exit 1
+    fi
+}
+
+get_latest_version() {
+    curl -sI --max-time 10 "https://github.com/YouROK/TorrServer/releases/latest" | \
+    grep -i '^location:' | \
+    sed -n 's/.*\(MatriX\.[0-9][0-9.]*\).*/\1/p' | head -n 1
+}
+
+network_available() {
+    curl -sSfL --head --max-time 5 "https://github.com" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+download_latest() {
+    local version="$1"
+    TMPDOWNLOAD="${TORR_SERVER_BIN}.part"
+    local url="https://github.com/YouROK/TorrServer/releases/download/${version}/TorrServer-linux-arm64"
+
+    if ! curl -sSfL --max-time 120 -o "$TMPDOWNLOAD" "$url"; then
+        log_error "Failed to download TorrServer binary (version $version)"
+        rm -f "$TMPDOWNLOAD"
+        return 1
+    fi
+
+    chmod +x "$TMPDOWNLOAD" || true
+
+    if mv -f "$TMPDOWNLOAD" "$TORR_SERVER_BIN"; then
+        log_info "Successfully updated to version $version"
+        return 0
+    else
+        log_error "Failed to move $TMPDOWNLOAD -> $TORR_SERVER_BIN"
+        rm -f "$TMPDOWNLOAD"
+        return 1
+    fi
+}
+
+server_alive_api() {
+    if curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$SERVER_URL/echo" 2>/dev/null | grep -q '^200$'; then
+        return 0
+    fi
+    return 1
+}
+
+shutdown_via_api() {
+    if curl -sS --max-time 5 "$SERVER_URL/shutdown" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+get_pid() {
+    if [ -f "$PIDFILE" ]; then
+        pid=$(cat "$PIDFILE" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+    pid=$(pgrep -f -n "$TORR_SERVER_BIN" || true)
+    echo "$pid"
+    return 0
+}
+
+is_running() {
+    if server_alive_api; then
+        return 0
+    fi
+    pid=$(get_pid)
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+get_current_version() {
+    local ver=""
+
+    if server_alive_api; then
+        ver=$(curl -sS --max-time 5 "$SERVER_URL/echo" 2>/dev/null | sed -n 's/.*\(MatriX\.[0-9][0-9.]*\).*/\1/p' | head -n 1 || true)
+    fi
+
+    if [ -z "$ver" ] && [ -x "$TORR_SERVER_BIN" ]; then
+        ver=$("$TORR_SERVER_BIN" --version 2>&1 | sed -n 's/.*\(MatriX\.[0-9][0-9.]*\).*/\1/p' | head -n 1 || true)
+    fi
+
+    echo "${ver:-MatriX.0}"
+}
+
+_start() {
+    if is_running; then
+        pid=$(get_pid)
+        if [ -n "$pid" ]; then
+            echo "already running (pid $pid)"
+        else
+            echo "already running"
+        fi
+        return 0
+    fi
+
+    require_tools
+
+    waited=0
+    while ! network_available && [ "$waited" -lt "$NETWORK_WAIT_SECS" ]; do
+        sleep "$NETWORK_CHECK_INTERVAL"
+        waited=$((waited + NETWORK_CHECK_INTERVAL))
+    done
+
+    if network_available; then
+        current=$(get_current_version)
+        latest=$(get_latest_version)
+
+        if [ -z "$latest" ]; then
+            log_error "Failed to determine the latest version"
+        elif [ "$current" != "$latest" ]; then
+            log_info "New version available: $latest (Current: $current). Downloading..."
+            download_latest "$latest" || log_error "Update failed. Using current version"
+        else
+            log_info "Version is up to date: $current"
+        fi
+    else
+        log_info "Network unavailable. Starting without update."
+    fi
+
+    if [ ! -x "$TORR_SERVER_BIN" ]; then
+        log_error "Binary not found or not executable: $TORR_SERVER_BIN"
+        return 1
+    fi
+
+    "$TORR_SERVER_BIN" -d "$TORR_SERVER_DIR" -p "$PORT" >/dev/console 2>&1 &
+    pid=$!
+    echo "$pid" >"$PIDFILE"
+    sleep 1
+
+    waited=0
+    while [ "$waited" -lt "$NETWORK_WAIT_SECS" ]; do
+        if server_alive_api; then
+            echo "started (pid $pid)"
+            log_info "Started (PID $pid)"
+            return 0
+        fi
+        sleep "$NETWORK_CHECK_INTERVAL"
+        waited=$((waited + NETWORK_CHECK_INTERVAL))
+    done
+
+    if kill -0 "$pid" >/dev/null 2>&1; then
+        echo "started (pid $pid) (API did not respond)"
+        log_info "Started (PID $pid), but API is not responding"
+        return 0
+    fi
+
+    log_error "Failed to start process"
+    rm -f "$PIDFILE" || true
+    return 1
+}
+
+_stop() {
+    if ! is_running; then
+        echo "already stopped"
+        log_info "Process is not running"
+        return 0
+    fi
+
+    if server_alive_api; then
+        log_info "Sending graceful shutdown request via API"
+        if shutdown_via_api; then
+            waited=0
+            while server_alive_api && [ "$waited" -lt "$SHUTDOWN_WAIT_SECS" ]; do
+                sleep "$SHUTDOWN_CHECK_INTERVAL"
+                waited=$((waited + SHUTDOWN_CHECK_INTERVAL))
+            done
+
+            if ! server_alive_api; then
+                rm -f "$PIDFILE" || true
+                echo "stopped"
+                log_info "Stopped via API"
+                return 0
+            fi
+
+            log_error "API did not stop the server within ${SHUTDOWN_WAIT_SECS}s"
+        else
+            log_error "Failed to call /shutdown on $SERVER_URL"
+        fi
+    else
+        log_info "API unavailable. Falling back to PID-based termination"
+    fi
+
+    pid=$(get_pid)
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+
+        if kill -0 "$pid" >/dev/null 2>&1; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+
+        rm -f "$PIDFILE" || true
+        echo "stopped"
+        log_info "Stopped (PID $pid)"
+        return 0
+    fi
+
+    echo "already stopped"
+    log_info "No process found to stop"
+    return 0
+}
+
+_status() {
+    if server_alive_api; then
+        ver=$(curl -sS --max-time 5 "$SERVER_URL/echo" 2>/dev/null || true)
+        if [ -n "$ver" ]; then
+            echo "running (api, version: $ver)"
+            return 0
+        fi
+        echo "running (api)"
+        return 0
+    fi
+
+    pid=$(get_pid)
+    if [ -n "$pid" ]; then
+        echo "running (pid $pid)"
+        return 0
+    fi
+
+    echo "stopped"
+    return 1
+}
+
+case "${1:-}" in
+start)
+    if [ "$ENABLED" = "yes" ]; then
+        _start
+    else
+        echo "Autostart is disabled"
+        exit 0
+    fi
+    ;;
+stop)
+    _stop
+    ;;
+restart)
+    _stop
+    sleep 1
+    _start
+    ;;
+status)
+    _status
+    ;;
+*)
+    echo "Usage: $0 {start|stop|restart|status}"
+    exit 2
+    ;;
+esac
+
+exit 0
