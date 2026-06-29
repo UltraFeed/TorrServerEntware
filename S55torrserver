@@ -16,6 +16,9 @@ PORT=${PORT:-8090}
 SERVER_URL=${SERVER_URL:-http://127.0.0.1:$PORT}
 LOGTAG="TorrServer"
 
+GLIBC_LOADER="/opt/lib/ld-linux-aarch64.so.1"
+GLIBC_LIBS="/opt/lib"
+
 NETWORK_WAIT_SECS=${NETWORK_WAIT_SECS:-60}
 NETWORK_CHECK_INTERVAL=${NETWORK_CHECK_INTERVAL:-5}
 SHUTDOWN_WAIT_SECS=${SHUTDOWN_WAIT_SECS:-10}
@@ -36,6 +39,14 @@ log() {
 
 log_info() { log "INFO" "$*"; }
 log_error() { log "ERROR" "$*"; }
+
+run_torrserver() {
+    if [ -x "$GLIBC_LOADER" ]; then
+        "$GLIBC_LOADER" --library-path "$GLIBC_LIBS" "$TORR_SERVER_BIN" "$@"
+    else
+        "$TORR_SERVER_BIN" "$@"
+    fi
+}
 
 create_torrserver_cmd() {
     local torr_cmd="/opt/bin/torrserver"
@@ -149,7 +160,7 @@ get_current_version() {
     fi
 
     if [ -z "$ver" ] && [ -x "$TORR_SERVER_BIN" ]; then
-        ver=$("$TORR_SERVER_BIN" --version 2>&1 | sed -n 's/.*\(MatriX\.[0-9][0-9.]*\).*/\1/p' | head -n 1 || true)
+        ver=$(run_torrserver --version 2>&1 | sed -n 's/.*\(MatriX\.[0-9][0-9.]*\).*/\1/p' | head -n 1 || true)
     fi
 
     echo "${ver:-MatriX.0}"
@@ -195,7 +206,7 @@ _start() {
         return 1
     fi
 
-    "$TORR_SERVER_BIN" -d "$TORR_SERVER_DIR" -p "$PORT" >/dev/console 2>&1 &
+    run_torrserver -d "$TORR_SERVER_DIR" -p "$PORT" >/dev/console 2>&1 &
     pid=$!
     echo "$pid" >"$PIDFILE"
     sleep 1
